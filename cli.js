@@ -124,7 +124,7 @@ const TOOLS = [
       name: 'summarize_files',
       description: 'Summarize one or more PDF/text files into a single PDF. Handles all chunking and API calls internally — NEVER hits context limits. Use this instead of manually reading chunks when summarizing documents. Perfect for lecture notes, research papers, textbooks.',
       parameters: { type: 'object', properties: {
-        paths:       { type: 'array', items: { type: 'string' }, description: 'File paths to summarize (PDFs or text files)' },
+        paths:       { type: 'array', items: { type: 'string' }, description: 'File paths to summarize (PDFs or text files), OR a single directory path to summarize all files inside it' },
         output_path: { type: 'string', description: 'Output .pdf path (e.g. "summary.pdf")' },
         title:       { type: 'string', description: 'Title for the summary document' },
         subject:     { type: 'string', description: 'Subject/domain context for better summaries (e.g. "information security")' },
@@ -460,13 +460,35 @@ async function opSummarizeFiles(paths, outputPath, title, subject) {
   const domain    = subject || 'the subject';
   let fullMarkdown = '';
 
-  for (let fi = 0; fi < paths.length; fi++) {
-    const filePath = paths[fi];
-    const fullPath = resolvePath(filePath);
-    const isPdf    = filePath.toLowerCase().endsWith('.pdf');
-    const name     = basename(filePath).replace(/\.(pdf|md|txt|tex)$/i, '');
+  // Expand directories to their constituent files
+  const SUMMARIZABLE = /\.(pdf|md|txt|tex|rst)$/i;
+  const expandedPaths = [];
+  for (const p of paths) {
+    const full = resolvePath(p);
+    const s    = await stat(full).catch(() => null);
+    if (s?.isDirectory()) {
+      const entries = await readdir(full, { withFileTypes: true });
+      const files   = entries
+        .filter(e => e.isFile() && SUMMARIZABLE.test(e.name) && !e.name.startsWith('.'))
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map(e => join(full, e.name));
+      expandedPaths.push(...files);
+      process.stdout.write(`  ${TREE} ${GRAY}expanded directory → ${files.length} files${RESET}\n`);
+    } else if (s?.isFile()) {
+      expandedPaths.push(full);
+    } else {
+      process.stdout.write(`  ${TREE} ${YELLOW}skipped (not found): ${p}${RESET}\n`);
+    }
+  }
+  if (expandedPaths.length === 0) throw new Error('No summarizable files found in the given paths.');
 
-    process.stdout.write(`\n${BULLET} ${WHITE}${name}${RESET} ${GRAY}(${fi+1}/${paths.length})${RESET}\n`);
+  for (let fi = 0; fi < expandedPaths.length; fi++) {
+    const filePath = expandedPaths[fi];
+    const fullPath = filePath; // already absolute after expansion
+    const isPdf    = filePath.toLowerCase().endsWith('.pdf');
+    const name     = basename(filePath).replace(/\.(pdf|md|txt|tex|rst)$/i, '');
+
+    process.stdout.write(`\n${BULLET} ${WHITE}${name}${RESET} ${GRAY}(${fi+1}/${expandedPaths.length})${RESET}\n`);
 
     // Extract raw text
     let raw;
@@ -526,7 +548,7 @@ Format your output as structured markdown:
   const outPath = await generatePdf(fullMarkdown, pdfPath, title || 'Summary', '', true);
   const sz      = (await execFileAsync('du', ['-sh', outPath]).catch(() => ({ stdout: '?' }))).stdout.trim().split('\t')[0];
   process.stdout.write(`  ${TREE} ${GRAY}${sz} — opened in viewer${RESET}\n`);
-  return `PDF created: ${outPath} (${sz}). Summarized ${paths.length} files.`;
+  return `PDF created: ${outPath} (${sz}). Summarized ${expandedPaths.length} files.`;
 }
 
 // ── Tool execution ────────────────────────────────────────────────────────────
