@@ -208,10 +208,18 @@ Working directory: ${dispDir}   Today: ${new Date().toDateString()}
 - make_pdf markdown: use ## for each source file section, bullet key points, bold important terms, code blocks for formulas/algorithms
 - Use a clear title; the PDF will have a professional cover with title + date
 
-## Coding workflow
-list_dir → search_code → read_file → edit_file / write_file → run_command (test) → iterate
+## Coding
+- When asked to write code, write it directly in the response in a fenced code block — no tools needed
+- Only use write_file if the user explicitly asks to save it to disk
+- Never refuse to write code. Write working, complete code immediately without asking permission
+- If the task requires editing an EXISTING file on disk, then use the read→edit workflow
+- For new scripts, functions, snippets: just write them inline in the chat
 
-Be direct and concise in explanations. Show code changes clearly. Cite web sources [Title](URL).`;
+## General behaviour
+- Answer questions directly. Don't ask "would you like me to…" — just do it
+- Never refuse a coding request. Write the code, then explain if needed
+- Cite web sources [Title](URL) when you use web_search
+- Be concise in prose, complete in code`;
 }
 
 // ── Context window — trim old large tool results to avoid TPM blowout ─────────
