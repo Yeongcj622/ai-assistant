@@ -190,11 +190,13 @@ Working directory: ${dispDir}   Today: ${new Date().toDateString()}
 ## PDF / notes workflow
 - read_file automatically extracts text from .pdf files using pdftotext — no binary garbage
 - Large files are chunked: default 150 lines/read for PDFs, 300 for text. Use offset+limit to page through
-- For summarising multiple files: process ONE file at a time. For each file:
-    1. read_file(file, offset=1, limit=150) → digest → read_file(file, offset=151, limit=150) → … repeat until no lines remain
-    2. Write that file's key points to a running notes variable in your head
-    3. Move to next file only when done with current
-  Then combine all notes → make_pdf
+- For summarising multiple files — CRITICAL: follow this workflow exactly:
+    1. Read a PDF in 100-line chunks using offset+limit
+    2. After finishing EACH COMPLETE FILE, immediately write_file("notes_XX.md") with bullet-point notes for that file
+    3. Move to the next file. Repeat.
+    4. After all files: read each notes_XX.md, combine into one markdown document, make_pdf
+  This keeps context small — raw PDF content is trimmed from history automatically after 3 turns.
+  NEVER try to hold all content in memory — always write intermediate notes to disk.
 - make_pdf markdown: use ## for each source file section, bullet key points, bold important terms, code blocks for formulas/algorithms
 - Use a clear title; the PDF will have a professional cover with title + date
 
@@ -204,10 +206,29 @@ list_dir → search_code → read_file → edit_file / write_file → run_comman
 Be direct and concise in explanations. Show code changes clearly. Cite web sources [Title](URL).`;
 }
 
-// ── Context window (trim to last 20 to avoid TPM blowout) ────────────────────
+// ── Context window — trim old large tool results to avoid TPM blowout ─────────
+const TOOL_RESULT_KEEP_TURNS = 3;   // how many recent turns keep full tool results
+const TOOL_RESULT_MAX_CHARS  = 400; // older results get truncated to this
+
 function buildContext() {
   const recent = messages.length > 20 ? messages.slice(-20) : messages;
-  return [{ role: 'system', content: buildSystem() }, ...recent];
+
+  // Find the message index marking the "keep full results" boundary
+  let keepFromIdx = recent.length;
+  let turnsSeen   = 0;
+  for (let i = recent.length - 1; i >= 0; i--) {
+    if (recent[i].role === 'user') { turnsSeen++; if (turnsSeen >= TOOL_RESULT_KEEP_TURNS) { keepFromIdx = i; break; } }
+  }
+
+  const trimmed = recent.map((msg, i) => {
+    if (i < keepFromIdx && msg.role === 'tool' && typeof msg.content === 'string' && msg.content.length > TOOL_RESULT_MAX_CHARS) {
+      // Keep only the first part so the AI knows what it read, but drop the bulk
+      return { ...msg, content: msg.content.slice(0, TOOL_RESULT_MAX_CHARS) + '\n[…content trimmed from context to save tokens]' };
+    }
+    return msg;
+  });
+
+  return [{ role: 'system', content: buildSystem() }, ...trimmed];
 }
 
 // ── Path helper ───────────────────────────────────────────────────────────────
@@ -270,8 +291,8 @@ function renderReply(text) {
 }
 
 // ── File operations ───────────────────────────────────────────────────────────
-const PDF_DEFAULT_LIMIT  = 150;  // lines per chunk for PDFs
-const TEXT_DEFAULT_LIMIT = 300;  // lines per chunk for large text files
+const PDF_DEFAULT_LIMIT  = 100;  // lines per chunk for PDFs
+const TEXT_DEFAULT_LIMIT = 200;  // lines per chunk for large text files
 
 async function extractPdfText(fullPath) {
   return new Promise((resolve, reject) => {
