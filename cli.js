@@ -121,6 +121,18 @@ const TOOLS = [
   },
   {
     type: 'function', function: {
+      name: 'summarize_files',
+      description: 'Summarize one or more PDF/text files into a single PDF. Handles all chunking and API calls internally — NEVER hits context limits. Use this instead of manually reading chunks when summarizing documents. Perfect for lecture notes, research papers, textbooks.',
+      parameters: { type: 'object', properties: {
+        paths:       { type: 'array', items: { type: 'string' }, description: 'File paths to summarize (PDFs or text files)' },
+        output_path: { type: 'string', description: 'Output .pdf path (e.g. "summary.pdf")' },
+        title:       { type: 'string', description: 'Title for the summary document' },
+        subject:     { type: 'string', description: 'Subject/domain context for better summaries (e.g. "information security")' },
+      }, required: ['paths', 'output_path'] },
+    },
+  },
+  {
+    type: 'function', function: {
       name: 'make_pdf',
       description: 'Create a professional PDF from markdown content. Use for: summarizing notes, creating reports, writing documents. Automatically opens the PDF when done.',
       parameters: { type: 'object', properties: {
@@ -188,15 +200,11 @@ Working directory: ${dispDir}   Today: ${new Date().toDateString()}
 6. When unsure about an API, function name, or library — use web_search first.
 
 ## PDF / notes workflow
-- read_file automatically extracts text from .pdf files using pdftotext — no binary garbage
-- Large files are chunked: default 150 lines/read for PDFs, 300 for text. Use offset+limit to page through
-- For summarising multiple files — CRITICAL: follow this workflow exactly:
-    1. Read a PDF in 100-line chunks using offset+limit
-    2. After finishing EACH COMPLETE FILE, immediately write_file("notes_XX.md") with bullet-point notes for that file
-    3. Move to the next file. Repeat.
-    4. After all files: read each notes_XX.md, combine into one markdown document, make_pdf
-  This keeps context small — raw PDF content is trimmed from history automatically after 3 turns.
-  NEVER try to hold all content in memory — always write intermediate notes to disk.
+- To summarize documents: ALWAYS use summarize_files([paths], output_path, title, subject)
+  It handles chunking, API calls, combining, and PDF generation internally — zero context blowout
+  Example: summarize_files(["Slides/01.pdf","Slides/02.pdf"], "summary.pdf", "My Notes", "physics")
+- make_pdf: use for writing NEW content as a PDF (reports, your own writing)
+- read_file extracts real text from .pdf files via pdftotext automatically
 - make_pdf markdown: use ## for each source file section, bullet key points, bold important terms, code blocks for formulas/algorithms
 - Use a clear title; the PDF will have a professional cover with title + date
 
@@ -406,6 +414,121 @@ function opSearchCode(pattern, path, fileGlob) {
   });
 }
 
+// ── Isolated single-shot API call (no chat history, no tools) ────────────────
+async function callApiOnce(system, user) {
+  for (const backend of OPENAI_BACKENDS) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await fetch(backend.url, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${backend.key}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model:      backend.model,
+            messages:   [{ role: 'system', content: system }, { role: 'user', content: user }],
+            stream:     false,
+            max_tokens: 1500,
+          }),
+          signal: AbortSignal.timeout(45000),
+        });
+        if (res.status === 429 || res.status === 413) {
+          const body = await res.text();
+          const m    = body.match(/try again in ([0-9.]+)s/i);
+          const wait = Math.min((m ? Math.ceil(parseFloat(m[1])) : (attempt + 1) * 5) * 1000, 15000);
+          process.stdout.write(`  ${GRAY}  ⏳ ${backend.name} limit, waiting ${Math.round(wait/1000)}s…${RESET}\r`);
+          await new Promise(r => setTimeout(r, wait));
+          continue;
+        }
+        if (!res.ok) break;
+        const data = await res.json();
+        return data.choices?.[0]?.message?.content?.trim() || '';
+      } catch { if (attempt < 2) await new Promise(r => setTimeout(r, 2000)); }
+    }
+  }
+  if (USE_OLLAMA_ONLY) {
+    const res  = await fetch(`${OLLAMA_URL}/api/chat`, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: OLLAMA_MODEL, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], stream: false }) });
+    const data = await res.json();
+    return data.message?.content?.trim() || '';
+  }
+  throw new Error('All backends failed');
+}
+
+// ── Batch summarization pipeline (runs entirely outside chat history) ─────────
+async function opSummarizeFiles(paths, outputPath, title, subject) {
+  const CHUNK     = 60;   // lines per summarization call
+  const DELAY     = 2500; // ms between API calls
+  const domain    = subject || 'the subject';
+  let fullMarkdown = '';
+
+  for (let fi = 0; fi < paths.length; fi++) {
+    const filePath = paths[fi];
+    const fullPath = resolvePath(filePath);
+    const isPdf    = filePath.toLowerCase().endsWith('.pdf');
+    const name     = basename(filePath).replace(/\.(pdf|md|txt|tex)$/i, '');
+
+    process.stdout.write(`\n${BULLET} ${WHITE}${name}${RESET} ${GRAY}(${fi+1}/${paths.length})${RESET}\n`);
+
+    // Extract raw text
+    let raw;
+    if (isPdf) {
+      raw = await new Promise((res, rej) => {
+        execFile('pdftotext', ['-layout', fullPath, '-'], { timeout: 30000, maxBuffer: 20*1024*1024 },
+          (err, stdout) => { if (err && !stdout) rej(new Error(`pdftotext: ${err.message}`)); else res(stdout); });
+      });
+    } else {
+      raw = await readFile(fullPath, 'utf8');
+    }
+
+    // Split into chunks, stripping blank lines to save tokens
+    const lines  = raw.split('\n').filter(l => l.trim().length > 1);
+    const chunks = [];
+    for (let i = 0; i < lines.length; i += CHUNK) chunks.push(lines.slice(i, i + CHUNK).join('\n'));
+
+    // Summarize each chunk with an isolated API call
+    const chunkSummaries = [];
+    for (let ci = 0; ci < chunks.length; ci++) {
+      process.stdout.write(`  ${BRANCH} ${GRAY}chunk ${ci+1}/${chunks.length}…         ${RESET}\r`);
+      const sys = `You are a precise note-taker summarizing lecture slides on ${domain} for a student.
+This is excerpt ${ci+1}/${chunks.length} from "${name}".
+Extract ALL key concepts, definitions, theorems, algorithms, and important facts.
+Format your output as structured markdown:
+- **Bold** key terms and names
+- Bullet points for facts, properties, steps
+- Preserve mathematical notation and pseudocode exactly
+- Subheadings (###) for distinct topics if multiple appear`;
+      const summary = await callApiOnce(sys, chunks[ci]);
+      chunkSummaries.push(summary);
+      if (ci < chunks.length - 1) await new Promise(r => setTimeout(r, DELAY));
+    }
+
+    // If multiple chunks, do one final combining call
+    let section;
+    if (chunkSummaries.length === 1) {
+      section = chunkSummaries[0];
+    } else {
+      process.stdout.write(`  ${BRANCH} ${GRAY}combining ${chunks.length} chunks…     ${RESET}\n`);
+      await new Promise(r => setTimeout(r, DELAY));
+      const combined = chunkSummaries.join('\n\n---\n\n');
+      section = await callApiOnce(
+        `Combine these ${chunks.length} partial summaries of "${name}" (${domain} lecture) into one cohesive markdown summary. Merge duplicate points, organize by topic with ### subheadings. Preserve ALL technical details, formulas, and definitions.`,
+        combined.slice(0, 12000)
+      );
+    }
+
+    fullMarkdown += `## ${name}\n\n${section}\n\n`;
+    process.stdout.write(`  ${TREE} ${GREEN}✓ done${RESET}                    \n`);
+  }
+
+  // Generate the PDF
+  process.stdout.write(`\n${BULLET} ${BLUE}Generating PDF${RESET}…\n`);
+  const pdfPath = resolvePath(outputPath);
+  await mkdir(dirname(pdfPath), { recursive: true });
+  const outPath = await generatePdf(fullMarkdown, pdfPath, title || 'Summary', '', true);
+  const sz      = (await execFileAsync('du', ['-sh', outPath]).catch(() => ({ stdout: '?' }))).stdout.trim().split('\t')[0];
+  process.stdout.write(`  ${TREE} ${GRAY}${sz} — opened in viewer${RESET}\n`);
+  return `PDF created: ${outPath} (${sz}). Summarized ${paths.length} files.`;
+}
+
 // ── Tool execution ────────────────────────────────────────────────────────────
 async function executeOneTool(name, args) {
 
@@ -475,6 +598,14 @@ async function executeOneTool(name, args) {
     return result;
   }
 
+  // ── Batch summarizer (runs outside chat history) ──────────────────────────────
+  if (name === 'summarize_files') {
+    const paths = args.paths.map(p => p);
+    process.stdout.write(`${BULLET} ${BLUE}SummarizeFiles${RESET}(${WHITE}${paths.length} files → ${args.output_path}${RESET})\n`);
+    const result = await opSummarizeFiles(paths, args.output_path, args.title, args.subject);
+    return result;
+  }
+
   // ── PDF generation ────────────────────────────────────────────────────────────
   if (name === 'make_pdf') {
     const rel = relative(workdir, resolvePath(args.output_path)) || args.output_path;
@@ -518,7 +649,7 @@ async function executeOneTool(name, args) {
 
 // Parallel for reads, sequential for writes
 async function executeTools(toolCalls) {
-  const readOnly   = new Set(['web_search', 'fetch_url', 'read_file', 'list_dir', 'search_code']);
+  const readOnly   = new Set(['web_search', 'fetch_url', 'read_file', 'list_dir', 'search_code', 'summarize_files']);
   const parallel   = toolCalls.filter(tc => readOnly.has(tc.name));
   const sequential = toolCalls.filter(tc => !readOnly.has(tc.name));
   const results    = new Map();
