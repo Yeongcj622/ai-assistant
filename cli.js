@@ -1,48 +1,57 @@
 import dotenv from 'dotenv';
 import readline from 'readline';
 import { exec } from 'child_process';
-import { formatForTerminal, renderBox, wrapText } from './format.js';
 import { webSearch, fetchUrl } from './tools.js';
 
 dotenv.config();
 
 // ── Config ──────────────────────────────────────────────────────────────────
-const GROQ_API_KEY  = process.env.GROQ_API_KEY || '';
-const GROQ_MODEL    = process.env.GROQ_MODEL    || 'llama-3.3-70b-versatile';
-const GROQ_URL      = 'https://api.groq.com/openai/v1/chat/completions';
-const OLLAMA_URL    = process.env.OLLAMA_URL    || 'http://localhost:11434';
-let   OLLAMA_MODEL  = process.env.OLLAMA_MODEL  || 'llama3.2:3b';
-const WORKDIR       = process.env.ASSISTANT_WORKDIR || process.env.HOME || process.cwd();
-const USE_GROQ      = !!GROQ_API_KEY;
+const CEREBRAS_API_KEY = process.env.CEREBRAS_API_KEY || '';
+const CEREBRAS_MODEL   = process.env.CEREBRAS_MODEL   || 'llama-3.3-70b';
+const CEREBRAS_URL     = 'https://api.cerebras.ai/v1/chat/completions';
+
+const GROQ_API_KEY     = process.env.GROQ_API_KEY || '';
+const GROQ_URL         = 'https://api.groq.com/openai/v1/chat/completions';
+
+const OLLAMA_URL       = process.env.OLLAMA_URL   || 'http://localhost:11434';
+const OLLAMA_MODEL     = process.env.OLLAMA_MODEL || 'llama3.2:3b';
+const WORKDIR          = process.env.ASSISTANT_WORKDIR || process.env.HOME || process.cwd();
+
+// Ordered fallback chain — first available wins each turn
+const OPENAI_BACKENDS = [
+  CEREBRAS_API_KEY && { name: 'Cerebras', label: `Cerebras/${CEREBRAS_MODEL}`, url: CEREBRAS_URL, key: CEREBRAS_API_KEY, model: CEREBRAS_MODEL },
+  GROQ_API_KEY     && { name: 'Groq',     label: `Groq/llama-4-scout`,         url: GROQ_URL,     key: GROQ_API_KEY,     model: 'meta-llama/llama-4-scout-17b-16e-instruct' },
+  GROQ_API_KEY     && { name: 'Groq-8b',  label: `Groq/llama-3.1-8b`,         url: GROQ_URL,     key: GROQ_API_KEY,     model: 'llama-3.1-8b-instant' },
+].filter(Boolean);
+const USE_OLLAMA_ONLY = OPENAI_BACKENDS.length === 0;
 
 // ── ANSI ────────────────────────────────────────────────────────────────────
-const DIM           = '\x1b[2m';
-const BOLD          = '\x1b[1m';
-const ITALIC        = '\x1b[3m';
-const USER_BG       = '\x1b[48;2;30;32;40m\x1b[38;2;200;210;230m';
-const GREEN         = '\x1b[38;2;80;200;120m';
-const ORANGE        = '\x1b[38;2;230;140;60m';
-const BLUE          = '\x1b[38;2;100;160;240m';
-const GRAY          = '\x1b[38;2;130;140;160m';
-const WHITE         = '\x1b[38;2;220;225;240m';
-const RESET         = '\x1b[0m';
-const BULLET        = `${GREEN}●${RESET}`;
-const TREE          = `${GRAY}└${RESET}`;
-const PROMPT        = `${GRAY}>${RESET} `;
+const DIM      = '\x1b[2m';
+const BOLD     = '\x1b[1m';
+const ITALIC   = '\x1b[3m';
+const USER_BG  = '\x1b[48;2;30;32;40m\x1b[38;2;200;210;230m';
+const GREEN    = '\x1b[38;2;80;200;120m';
+const ORANGE   = '\x1b[38;2;230;140;60m';
+const BLUE     = '\x1b[38;2;100;160;240m';
+const GRAY     = '\x1b[38;2;130;140;160m';
+const WHITE    = '\x1b[38;2;220;225;240m';
+const YELLOW   = '\x1b[38;2;220;190;80m';
+const RESET    = '\x1b[0m';
+const BULLET   = `${GREEN}●${RESET}`;
+const TREE     = `${GRAY}└${RESET}`;
+const PROMPT   = `${GRAY}>${RESET} `;
 const APPROVAL_PROMPT = `${BOLD}Allow this command? [y/N]${RESET} `;
 
-// ── Tool definitions ─────────────────────────────────────────────────────────
-const TOOLS_OPENAI = [
+// ── Tool definitions ──────────────────────────────────────────────────────────
+const TOOLS = [
   {
     type: 'function',
     function: {
       name: 'web_search',
-      description: 'Search the internet for current, accurate information. Use this proactively for any factual question, current event, price, person, news, or anything that may have changed since training.',
+      description: 'Search the web for current facts, news, prices, people, events. Use proactively for anything time-sensitive or that may have changed since training.',
       parameters: {
         type: 'object',
-        properties: {
-          query: { type: 'string', description: 'A focused search query optimised for web search.' },
-        },
+        properties: { query: { type: 'string', description: 'Focused search query.' } },
         required: ['query'],
       },
     },
@@ -51,12 +60,10 @@ const TOOLS_OPENAI = [
     type: 'function',
     function: {
       name: 'fetch_url',
-      description: 'Read the full content of a specific web page. Use this after web_search to get details from a promising result URL.',
+      description: 'Fetch full text of a web page. Use after web_search to read a specific result.',
       parameters: {
         type: 'object',
-        properties: {
-          url: { type: 'string', description: 'Full URL to fetch.' },
-        },
+        properties: { url: { type: 'string', description: 'Full URL to fetch.' } },
         required: ['url'],
       },
     },
@@ -65,12 +72,12 @@ const TOOLS_OPENAI = [
     type: 'function',
     function: {
       name: 'run_command',
-      description: "Run a shell command on the user's computer. This requires explicit user approval before executing.",
+      description: "Run a shell command on the user's computer. Requires explicit user approval.",
       parameters: {
         type: 'object',
         properties: {
-          command:     { type: 'string', description: 'The exact shell command to run.' },
-          description: { type: 'string', description: 'Plain-English explanation of what it does and why.' },
+          command:     { type: 'string', description: 'Shell command to run.' },
+          description: { type: 'string', description: 'Plain-English explanation of what it does.' },
         },
         required: ['command', 'description'],
       },
@@ -78,28 +85,23 @@ const TOOLS_OPENAI = [
   },
 ];
 
-// Ollama uses the same OpenAI format for tools.
-const TOOLS_OLLAMA = TOOLS_OPENAI;
-
-// ── System prompt ─────────────────────────────────────────────────────────────
-const SYSTEM = `You are a fast, accurate personal assistant running in the terminal.
-
-You have three tools:
-• web_search(query)  — search DuckDuckGo for current information. Use it freely whenever a question involves facts, news, current events, prices, people, or anything time-sensitive.
-• fetch_url(url)     — read the text content of any web page. Use it to follow up on a search result.
-• run_command(command, description) — run a shell command (requires the user to approve each time).
-
-Formatting rules:
-- Write code in fenced code blocks with a language tag.
-- Write maths using LaTeX ($..$ for inline, $$...$$ for display).
-- When you use web_search, always cite sources with [Title](URL) links.
-- Keep answers concise but complete. If unsure, search first.`;
+// ── System prompt (kept short to save tokens) ────────────────────────────────
+const SYSTEM = `You are a fast, accurate personal assistant in the terminal. Today: ${new Date().toDateString()}.
+Tools available: web_search(query), fetch_url(url), run_command(command, description).
+Use web_search freely for current info, news, prices, or anything time-sensitive. Cite sources as [Title](URL).
+Code in fenced blocks with language tag. Be concise but complete.`;
 
 // ── State ────────────────────────────────────────────────────────────────────
 const messages = [];
 let pendingApproval = null;
 let busy = false;
 const queue = [];
+
+// Keep context lean: only last 20 messages (10 turns) to avoid TPM limits
+function buildContext() {
+  const recent = messages.length > 20 ? messages.slice(-20) : messages;
+  return [{ role: 'system', content: SYSTEM }, ...recent];
+}
 
 // ── Terminal helpers ──────────────────────────────────────────────────────────
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: PROMPT });
@@ -111,41 +113,29 @@ function clearLine() {
   }
 }
 
-function printAbove(text) {
-  clearLine();
-  process.stdout.write(text + '\n');
-  rl.prompt(true);
-}
-
-function separator() {
-  printAbove('');
-}
-
-// Render code blocks with line numbers (Claude Code style)
+// Render code blocks with line numbers
 function renderCodeBlock(lang, code) {
-  const lines = code.replace(/\n$/, '').split('\n');
+  const lines  = code.replace(/\n$/, '').split('\n');
   const numW   = String(lines.length).length;
   const header = `${GRAY}${lang || 'code'}${RESET}`;
-  const body   = lines.map((l, i) =>
+  const body   = lines.slice(0, 40).map((l, i) =>
     `  ${GRAY}${String(i + 1).padStart(numW)}${RESET}  ${WHITE}${l}${RESET}`
   ).join('\n');
-  const truncNote = lines.length > 40 ? `\n  ${GRAY}… ${lines.length - 40} more lines${RESET}` : '';
-  return `${header}\n${body.split('\n').slice(0, 40).join('\n')}${truncNote}`;
+  const trunc  = lines.length > 40 ? `\n  ${GRAY}… ${lines.length - 40} more lines${RESET}` : '';
+  return `${header}\n${body}${trunc}`;
 }
 
-// Render assistant text: bullet prefix + inline markdown
+// Render assistant markdown reply
 function renderReply(text) {
-  const lines = text.split('\n');
-  const out   = [];
-  let inCode  = false;
+  const lines  = text.split('\n');
+  const out    = [];
+  let inCode   = false;
   let codeLang = '';
   let codeBuf  = [];
 
   for (const line of lines) {
     if (!inCode && line.startsWith('```')) {
-      inCode   = true;
-      codeLang = line.slice(3).trim();
-      codeBuf  = [];
+      inCode = true; codeLang = line.slice(3).trim(); codeBuf = [];
       continue;
     }
     if (inCode && line.startsWith('```')) {
@@ -155,12 +145,11 @@ function renderReply(text) {
     }
     if (inCode) { codeBuf.push(line); continue; }
 
-    // Inline markdown
     let l = line
       .replace(/\*\*([^*]+)\*\*/g, `${BOLD}$1${RESET}`)
       .replace(/\*([^*]+)\*/g,     `${ITALIC}$1${RESET}`)
       .replace(/`([^`]+)`/g,       `${ORANGE}$1${RESET}`)
-      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, `${BLUE}$1${RESET}${GRAY}(${RESET}${DIM}$2${RESET}${GRAY})${RESET}`)
+      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, `${BLUE}$1${RESET}${GRAY}(${DIM}$2${RESET}${GRAY})${RESET}`)
       .replace(/^#{1,3} (.+)$/, `${BOLD}${WHITE}$1${RESET}`)
       .replace(/^[-*] /, `${GRAY}• ${RESET}`);
     out.push(l);
@@ -169,7 +158,7 @@ function renderReply(text) {
   return out.join('\n');
 }
 
-// ── SSE stream parser (Groq / OpenAI format) ─────────────────────────────────
+// ── SSE stream parser ─────────────────────────────────────────────────────────
 async function* sseLines(body) {
   const reader  = body.getReader();
   const decoder = new TextDecoder();
@@ -178,8 +167,7 @@ async function* sseLines(body) {
     const { done, value } = await reader.read();
     if (done) break;
     buf += decoder.decode(value, { stream: true });
-    const lines = buf.split('\n');
-    buf = lines.pop();
+    const lines = buf.split('\n'); buf = lines.pop();
     for (const line of lines) {
       const t = line.trim();
       if (t.startsWith('data: ')) yield t.slice(6);
@@ -187,14 +175,26 @@ async function* sseLines(body) {
   }
 }
 
-// ── Streaming call: yields { type:'token', text } | { type:'finish', content, toolCalls } ──
-async function* streamGroq(msgs) {
-  const res = await fetch(GROQ_URL, {
+// ── OpenAI-compatible stream (Groq + Cerebras) ───────────────────────────────
+async function* streamOpenAI(backend, msgs) {
+  const res = await fetch(backend.url, {
     method:  'POST',
-    headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: GROQ_MODEL, messages: msgs, stream: true, tools: TOOLS_OPENAI, tool_choice: 'auto', max_tokens: 8192 }),
+    headers: { 'Authorization': `Bearer ${backend.key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: backend.model, messages: msgs, stream: true,
+      tools: TOOLS, tool_choice: 'auto', max_tokens: 4096,
+    }),
   });
-  if (!res.ok) throw new Error(`Groq API error ${res.status}: ${await res.text()}`);
+
+  if (!res.ok) {
+    const body = await res.text();
+    const err  = new Error(`${backend.name} ${res.status}: ${body}`);
+    err.status = res.status;
+    // Parse retry-after from error message if present
+    const m = body.match(/try again in ([0-9.]+)s/i);
+    err.retryAfter = m ? Math.ceil(parseFloat(m[1])) : 10;
+    throw err;
+  }
 
   let content = '';
   const tcMap = {};
@@ -203,16 +203,16 @@ async function* streamGroq(msgs) {
     if (raw === '[DONE]') break;
     let data; try { data = JSON.parse(raw); } catch { continue; }
     const choice = data.choices?.[0]; if (!choice) continue;
-    const delta  = choice.delta       || {};
+    const delta  = choice.delta || {};
 
     if (delta.content) { content += delta.content; yield { type: 'token', text: delta.content }; }
 
     if (delta.tool_calls) {
       for (const tc of delta.tool_calls) {
         if (!tcMap[tc.index]) tcMap[tc.index] = { id: '', name: '', args: '' };
-        if (tc.id)                 tcMap[tc.index].id   = tc.id;
-        if (tc.function?.name)     tcMap[tc.index].name += tc.function.name;
-        if (tc.function?.arguments)tcMap[tc.index].args += tc.function.arguments;
+        if (tc.id)                  tcMap[tc.index].id   = tc.id;
+        if (tc.function?.name)      tcMap[tc.index].name += tc.function.name;
+        if (tc.function?.arguments) tcMap[tc.index].args += tc.function.arguments;
       }
     }
 
@@ -226,19 +226,17 @@ async function* streamGroq(msgs) {
   }
 }
 
+// ── Ollama stream ─────────────────────────────────────────────────────────────
 async function* streamOllama(msgs) {
   const res = await fetch(`${OLLAMA_URL}/api/chat`, {
     method:  'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model: OLLAMA_MODEL, messages: msgs, stream: true, tools: TOOLS_OLLAMA }),
+    body: JSON.stringify({ model: OLLAMA_MODEL, messages: msgs, stream: true, tools: TOOLS }),
   });
-  if (!res.ok) throw new Error(`Ollama error ${res.status}`);
+  if (!res.ok) throw new Error(`Ollama ${res.status}`);
 
-  const reader  = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = '';
-  let content = '';
-
+  const reader = res.body.getReader(); const decoder = new TextDecoder();
+  let buf = ''; let content = '';
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -250,8 +248,7 @@ async function* streamOllama(msgs) {
       if (data.message?.content) { content += data.message.content; yield { type: 'token', text: data.message.content }; }
       if (data.done) {
         const toolCalls = (data.message?.tool_calls || []).map(tc => ({
-          id:   tc.id || '',
-          name: tc.function.name,
+          id: tc.id || '', name: tc.function.name,
           args: typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function.arguments,
         }));
         yield { type: 'finish', content, toolCalls };
@@ -260,33 +257,24 @@ async function* streamOllama(msgs) {
   }
 }
 
-// ── Execute tools ─────────────────────────────────────────────────────────────
-async function executeTool(name, args) {
+// ── Execute tools (parallel when possible) ───────────────────────────────────
+async function executeOneTool(name, args) {
   if (name === 'web_search') {
-    clearLine();
     process.stdout.write(`${BULLET} ${ORANGE}web_search${RESET}${GRAY}(${RESET}"${args.query}"${GRAY})${RESET}\n`);
     const results = await webSearch(args.query);
-    const formatted = results.map((r, i) =>
-      `[${i+1}] **${r.title}**\nURL: ${r.url}\n${r.snippet}`
-    ).join('\n\n');
-    process.stdout.write(`  ${TREE} ${GRAY}${results.length} results found${RESET}\n\n`);
-    rl.prompt(true);
-    return formatted;
+    process.stdout.write(`  ${TREE} ${GRAY}${results.length} results${RESET}\n`);
+    return results.map((r, i) => `[${i+1}] **${r.title}**\nURL: ${r.url}\n${r.snippet}`).join('\n\n');
   }
 
   if (name === 'fetch_url') {
     const short = args.url.replace(/^https?:\/\//, '').slice(0, 60);
-    clearLine();
     process.stdout.write(`${BULLET} ${ORANGE}fetch_url${RESET}${GRAY}(${RESET}${short}${GRAY})${RESET}\n`);
-    const text = await fetchUrl(args.url);
-    const lines = text.split('\n').length;
-    process.stdout.write(`  ${TREE} ${GRAY}${lines} lines read${RESET}\n\n`);
-    rl.prompt(true);
+    const text  = await fetchUrl(args.url);
+    process.stdout.write(`  ${TREE} ${GRAY}${text.split('\n').length} lines${RESET}\n`);
     return text;
   }
 
   if (name === 'run_command') {
-    clearLine();
     process.stdout.write(`${BULLET} ${ORANGE}run_command${RESET}${GRAY}(${RESET}${args.command}${GRAY})${RESET}\n`);
     process.stdout.write(`  ${TREE} ${GRAY}${args.description || ''}${RESET}\n`);
     rl.setPrompt(APPROVAL_PROMPT);
@@ -294,19 +282,53 @@ async function executeTool(name, args) {
     const approved = await new Promise(resolve => { pendingApproval = { resolve }; });
     rl.setPrompt(PROMPT);
     if (!approved) {
-      process.stdout.write(`  ${TREE} ${GRAY}Denied by user${RESET}\n\n`);
+      process.stdout.write(`  ${TREE} ${GRAY}Denied${RESET}\n`);
       return '[user denied the command]';
     }
-    const output = await runShell(args.command);
+    const output  = await runShell(args.command);
     const outLines = output.trim().split('\n');
-    const shown = outLines.slice(0, 20).join('\n');
-    const extra = outLines.length > 20 ? `\n  ${GRAY}… +${outLines.length - 20} lines${RESET}` : '';
-    process.stdout.write(`  ${TREE} ${GRAY}${shown}${extra}${RESET}\n\n`);
-    rl.prompt(true);
+    const shown   = outLines.slice(0, 20).join('\n');
+    const extra   = outLines.length > 20 ? `\n  ${GRAY}… +${outLines.length - 20} lines${RESET}` : '';
+    process.stdout.write(`  ${TREE} ${GRAY}${shown}${extra}${RESET}\n`);
     return output;
   }
 
   throw new Error(`Unknown tool: ${name}`);
+}
+
+// Run non-interactive tools in parallel; run_command must be sequential
+async function executeTools(toolCalls) {
+  const interactive = toolCalls.filter(tc => tc.name === 'run_command');
+  const automatic   = toolCalls.filter(tc => tc.name !== 'run_command');
+
+  const results = new Map();
+
+  // Parallel automatic tools
+  clearLine();
+  await Promise.all(automatic.map(async tc => {
+    try {
+      results.set(tc.id || tc.name, await executeOneTool(tc.name, tc.args));
+    } catch (e) {
+      process.stdout.write(`  ${TREE} ${GRAY}${tc.name} failed: ${e.message}${RESET}\n`);
+      results.set(tc.id || tc.name, `Error: ${e.message}`);
+    }
+  }));
+
+  // Sequential interactive tools
+  for (const tc of interactive) {
+    try {
+      results.set(tc.id || tc.name, await executeOneTool(tc.name, tc.args));
+    } catch (e) {
+      process.stdout.write(`  ${TREE} ${GRAY}${tc.name} failed: ${e.message}${RESET}\n`);
+      results.set(tc.id || tc.name, `Error: ${e.message}`);
+    }
+  }
+
+  return toolCalls.map(tc => ({
+    role: 'tool',
+    tool_call_id: tc.id || tc.name,
+    content: results.get(tc.id || tc.name) ?? '',
+  }));
 }
 
 function runShell(command) {
@@ -322,19 +344,32 @@ function runShell(command) {
   });
 }
 
-// ── Core turn ─────────────────────────────────────────────────────────────────
-async function runTurn() {
-  const context = [{ role: 'system', content: SYSTEM }, ...messages];
+// ── Core turn — tries backends in order, skips on 429 ────────────────────────
+async function runTurn(backendIndex = 0) {
+  const ctx = buildContext();
 
   clearLine();
   process.stdout.write(`${BULLET} ${GRAY}…${RESET}`);
+
+  // Pick stream source
+  let stream;
+  let usedBackend = null;
+
+  if (!USE_OLLAMA_ONLY && backendIndex < OPENAI_BACKENDS.length) {
+    usedBackend = OPENAI_BACKENDS[backendIndex];
+    try {
+      stream = streamOpenAI(usedBackend, ctx);
+    } catch {
+      return runTurn(backendIndex + 1);
+    }
+  } else {
+    stream = streamOllama(ctx);
+  }
 
   let firstToken = true;
   let fullContent = '';
 
   try {
-    const stream = USE_GROQ ? streamGroq(context) : streamOllama(context);
-
     for await (const event of stream) {
       if (event.type === 'token') {
         if (firstToken) {
@@ -351,7 +386,6 @@ async function runTurn() {
           clearLine();
         } else {
           process.stdout.write('\n');
-          // Re-render code blocks with line numbers
           if (fullContent.includes('```')) {
             const rendered = renderReply(fullContent);
             readline.moveCursor(process.stdout, 0, -(fullContent.split('\n').length + 1));
@@ -360,21 +394,19 @@ async function runTurn() {
           }
         }
 
-        messages.push({ role: 'assistant', content: event.content || null, tool_calls: event.toolCalls.length ? event.toolCalls.map(tc => ({
-          id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify(tc.args) }
-        })) : undefined });
+        messages.push({
+          role: 'assistant',
+          content: event.content || null,
+          tool_calls: event.toolCalls.length ? event.toolCalls.map(tc => ({
+            id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify(tc.args) },
+          })) : undefined,
+        });
 
         if (event.toolCalls.length > 0) {
-          for (const tc of event.toolCalls) {
-            let result;
-            try   { result = await executeTool(tc.name, tc.args); }
-            catch (e) {
-              result = `Error: ${e.message}`;
-              process.stdout.write(`${BULLET} ${ORANGE}${tc.name}${RESET} ${GRAY}failed:${RESET} ${e.message}\n`);
-            }
-            messages.push({ role: 'tool', tool_call_id: tc.id || tc.name, content: result });
-          }
-          await runTurn();
+          const toolResults = await executeTools(event.toolCalls);
+          process.stdout.write('\n');
+          messages.push(...toolResults);
+          await runTurn(backendIndex);
           return;
         }
 
@@ -384,9 +416,20 @@ async function runTurn() {
     }
   } catch (err) {
     clearLine();
-    const hint = USE_GROQ
-      ? `Could not reach Groq. Check GROQ_API_KEY in .env. (${err.message})`
-      : `Could not reach Ollama at ${OLLAMA_URL}. Is it running? (${err.message})`;
+
+    // Rate limited — try next backend silently
+    if (err.status === 429 && !USE_OLLAMA_ONLY && backendIndex + 1 < OPENAI_BACKENDS.length) {
+      const next = OPENAI_BACKENDS[backendIndex + 1];
+      process.stdout.write(`  ${TREE} ${YELLOW}${usedBackend?.name} rate-limited → trying ${next.name}${RESET}\n`);
+      return runTurn(backendIndex + 1);
+    }
+
+    // All backends exhausted or different error
+    const hint = USE_OLLAMA_ONLY
+      ? `Could not reach Ollama at ${OLLAMA_URL}. Is it running?`
+      : err.status === 429
+        ? `All backends rate-limited. Wait a moment and try again.`
+        : err.message;
     process.stdout.write(`${BULLET} ${GRAY}${hint}${RESET}\n\n`);
     rl.prompt();
   }
@@ -400,14 +443,17 @@ async function processQueue() {
   busy = false;
 }
 
-const backend = USE_GROQ ? `Groq / ${GROQ_MODEL}` : `Ollama / ${OLLAMA_MODEL}`;
-process.stdout.write(`\n${BULLET} ${WHITE}AI Assistant${RESET}  ${GRAY}${backend}${RESET}\n`);
-process.stdout.write(`  ${TREE} ${GRAY}/clear  /exit${RESET}\n\n`);
+// Startup banner
+const primaryLabel = OPENAI_BACKENDS[0]?.label ?? `Ollama/${OLLAMA_MODEL}`;
+const fallbacks    = OPENAI_BACKENDS.slice(1).map(b => b.label).join(', ');
+process.stdout.write(`\n${BULLET} ${WHITE}AI Assistant${RESET}  ${GRAY}${primaryLabel}${RESET}`);
+if (fallbacks) process.stdout.write(`  ${GRAY}(fallback: ${fallbacks})${RESET}`);
+process.stdout.write(`\n  ${TREE} ${GRAY}/clear  /exit${RESET}\n\n`);
 rl.prompt();
 
 rl.on('line', (line) => {
   if (pendingApproval) {
-    const answer = line.trim().toLowerCase();
+    const answer  = line.trim().toLowerCase();
     const resolve = pendingApproval.resolve;
     pendingApproval = null;
     resolve(answer === 'y' || answer === 'yes');
@@ -419,12 +465,12 @@ rl.on('line', (line) => {
   if (process.stdout.isTTY && text) {
     readline.moveCursor(process.stdout, 0, -1);
     readline.clearLine(process.stdout, 0);
-    console.log(`${USER_BG}${BOLD}you>${RESET}${USER_BG} ${line}${RESET}`);
+    process.stdout.write(`${USER_BG}${BOLD}you>${RESET}${USER_BG} ${line}${RESET}\n`);
   }
 
-  if (text === '/exit') { rl.close(); return; }
-  if (text === '/clear') { messages.length = 0; console.log('(conversation cleared)\n'); rl.prompt(); return; }
-  if (text.startsWith('/system ')) { messages.unshift({ role: 'system', content: text.slice(8).trim() }); console.log('(system prompt set)\n'); rl.prompt(); return; }
+  if (text === '/exit')  { rl.close(); return; }
+  if (text === '/clear') { messages.length = 0; process.stdout.write(`  ${TREE} ${GRAY}Conversation cleared${RESET}\n\n`); rl.prompt(); return; }
+  if (text.startsWith('/system ')) { messages.unshift({ role: 'system', content: text.slice(8).trim() }); process.stdout.write(`  ${TREE} ${GRAY}System prompt set${RESET}\n\n`); rl.prompt(); return; }
   if (!text) { rl.prompt(); return; }
 
   messages.push({ role: 'user', content: text });
@@ -433,4 +479,4 @@ rl.on('line', (line) => {
   processQueue();
 });
 
-rl.on('close', () => { console.log('\nBye!'); process.exit(0); });
+rl.on('close', () => { process.stdout.write('\nBye!\n'); process.exit(0); });
