@@ -414,49 +414,93 @@ function opSearchCode(pattern, path, fileGlob) {
   });
 }
 
+// ── Per-backend cooldown tracker (respects each provider's RPM) ──────────────
+const backendReady = new Map(); // name → timestamp when next call is allowed
+
+// Requests per minute for each provider's free tier
+const BACKEND_RPM = { Cerebras: 60, Gemini: 14, Groq: 28, 'Groq-8b': 28 };
+
+async function waitForBackend(name) {
+  const ready = backendReady.get(name) || 0;
+  const wait  = ready - Date.now();
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+}
+
+function markBackendUsed(name) {
+  const rpm = BACKEND_RPM[name] || 20;
+  backendReady.set(name, Date.now() + Math.ceil(60000 / rpm));
+}
+
+function markBackendCooling(name, retryAfterMs) {
+  backendReady.set(name, Date.now() + retryAfterMs);
+}
+
 // ── Isolated single-shot API call (no chat history, no tools) ────────────────
 async function callApiOnce(system, user) {
-  for (const backend of OPENAI_BACKENDS) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const res = await fetch(backend.url, {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${backend.key}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model:      backend.model,
-            messages:   [{ role: 'system', content: system }, { role: 'user', content: user }],
-            stream:     false,
-            max_tokens: 1500,
-          }),
-          signal: AbortSignal.timeout(45000),
-        });
-        if (res.status === 429 || res.status === 413) {
-          const body = await res.text();
-          const m    = body.match(/try again in ([0-9.]+)s/i);
-          const wait = Math.min((m ? Math.ceil(parseFloat(m[1])) : (attempt + 1) * 5) * 1000, 15000);
-          process.stdout.write(`  ${GRAY}  ⏳ ${backend.name} limit, waiting ${Math.round(wait/1000)}s…${RESET}\r`);
-          await new Promise(r => setTimeout(r, wait));
-          continue;
-        }
-        if (!res.ok) break;
-        const data = await res.json();
-        return data.choices?.[0]?.message?.content?.trim() || '';
-      } catch { if (attempt < 2) await new Promise(r => setTimeout(r, 2000)); }
+  // Sort backends by when they're next available
+  const sorted = [...OPENAI_BACKENDS].sort((a, b) =>
+    (backendReady.get(a.name) || 0) - (backendReady.get(b.name) || 0)
+  );
+
+  for (const backend of sorted) {
+    await waitForBackend(backend.name);
+    try {
+      const res = await fetch(backend.url, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${backend.key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model:      backend.model,
+          messages:   [{ role: 'system', content: system }, { role: 'user', content: user }],
+          stream:     false,
+          max_tokens: 1500,
+        }),
+        signal: AbortSignal.timeout(45000),
+      });
+
+      if (res.status === 429 || res.status === 413) {
+        const body = await res.text();
+        const m    = body.match(/try again in ([0-9.]+)s/i);
+        const cool = (m ? Math.ceil(parseFloat(m[1])) : 30) * 1000;
+        markBackendCooling(backend.name, cool);
+        process.stdout.write(`  ${GRAY}  ${backend.name} rate-limited (${Math.round(cool/1000)}s cooldown)${RESET}\n`);
+        continue; // immediately try next backend
+      }
+      if (!res.ok) { markBackendCooling(backend.name, 5000); continue; }
+
+      markBackendUsed(backend.name);
+      const data = await res.json();
+      return data.choices?.[0]?.message?.content?.trim() || '';
+    } catch { markBackendCooling(backend.name, 3000); }
+  }
+
+  // All OpenAI-compatible backends exhausted — try Ollama
+  if (!USE_OLLAMA_ONLY) {
+    // Wait for the earliest backend to recover, then retry
+    const earliest = Math.min(...OPENAI_BACKENDS.map(b => backendReady.get(b.name) || 0));
+    const wait     = Math.max(0, earliest - Date.now());
+    if (wait > 0 && wait < 60000) {
+      process.stdout.write(`  ${GRAY}  all backends cooling, waiting ${Math.round(wait/1000)}s…${RESET}\r`);
+      await new Promise(r => setTimeout(r, wait));
+      return callApiOnce(system, user); // retry
     }
   }
-  if (USE_OLLAMA_ONLY) {
-    const res  = await fetch(`${OLLAMA_URL}/api/chat`, { method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: OLLAMA_MODEL, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], stream: false }) });
-    const data = await res.json();
-    return data.message?.content?.trim() || '';
+
+  if (USE_OLLAMA_ONLY || true) {
+    try {
+      const res  = await fetch(`${OLLAMA_URL}/api/chat`, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: OLLAMA_MODEL, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], stream: false }),
+        signal: AbortSignal.timeout(120000) });
+      const data = await res.json();
+      if (data.message?.content) return data.message.content.trim();
+    } catch {}
   }
-  throw new Error('All backends failed');
+
+  throw new Error('All backends failed — check API keys');
 }
 
 // ── Batch summarization pipeline (runs entirely outside chat history) ─────────
 async function opSummarizeFiles(paths, outputPath, title, subject) {
   const CHUNK     = 60;   // lines per summarization call
-  const DELAY     = 2500; // ms between API calls
   const domain    = subject || 'the subject';
   let fullMarkdown = '';
 
@@ -520,7 +564,6 @@ Format your output as structured markdown:
 - Subheadings (###) for distinct topics if multiple appear`;
       const summary = await callApiOnce(sys, chunks[ci]);
       chunkSummaries.push(summary);
-      if (ci < chunks.length - 1) await new Promise(r => setTimeout(r, DELAY));
     }
 
     // If multiple chunks, do one final combining call
@@ -529,7 +572,6 @@ Format your output as structured markdown:
       section = chunkSummaries[0];
     } else {
       process.stdout.write(`  ${BRANCH} ${GRAY}combining ${chunks.length} chunks…     ${RESET}\n`);
-      await new Promise(r => setTimeout(r, DELAY));
       const combined = chunkSummaries.join('\n\n---\n\n');
       section = await callApiOnce(
         `Combine these ${chunks.length} partial summaries of "${name}" (${domain} lecture) into one cohesive markdown summary. Merge duplicate points, organize by topic with ### subheadings. Preserve ALL technical details, formulas, and definitions.`,
