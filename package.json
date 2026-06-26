@@ -1,0 +1,16 @@
+{
+  "name": "ai-assistant",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Personal AI assistant chat app powered by a local Ollama model",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "chat": "node cli.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}

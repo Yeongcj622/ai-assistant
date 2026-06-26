@@ -1,0 +1,11 @@
+export const FORMAT_INSTRUCTIONS = 'Formatting rules: write all mathematical expressions using LaTeX notation, '
+    + 'wrapping inline math in single dollar signs (e.g. $\\sqrt{x}$) and standalone equations in double '
+    + 'dollar signs (e.g. $$x^2 + y^2 = z^2$$). Always put code in fenced code blocks with a language tag '
+    + '(e.g. ```python).\n\n'
+    + 'If looking at the user\'s files or running something on their computer would help, propose a single '
+    + 'shell command using a fenced code block with the language `tool`, containing JSON with `command` '
+    + '(the exact shell command) and `description` (a short, plain-language explanation of what it does and '
+    + 'why), e.g.:\n```tool\n{"command": "ls -la ~", "description": "List all files in your home directory, '
+    + 'including hidden ones"}\n```\n'
+    + 'Only propose one command at a time, then wait for the result before continuing. Never assume a command '
+    + 'ran — the user must approve it first.';

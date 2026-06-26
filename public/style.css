@@ -1,0 +1,344 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html, body {
+    height: 100%;
+    font-family: 'Segoe UI', Tahoma, Verdana, sans-serif;
+    color: #2b2b2b;
+    background: #f4f1ec;
+}
+
+body {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+}
+
+header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 20px;
+    background: #5d4a7e;
+    color: #fff;
+}
+
+header h1 {
+    font-size: 1.2rem;
+}
+
+.header-actions {
+    display: flex;
+    gap: 8px;
+}
+
+main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    max-width: 760px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 16px;
+    overflow: hidden;
+}
+
+.messages {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 4px 4px 12px;
+}
+
+.message {
+    max-width: 80%;
+    padding: 10px 14px;
+    border-radius: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+.message.user {
+    align-self: flex-end;
+    background: #d6ecff;
+    color: #1a3a4a;
+    border-bottom-right-radius: 4px;
+}
+
+.message.assistant {
+    align-self: flex-start;
+    background: none;
+    border: none;
+    padding: 10px 0;
+    white-space: normal;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+}
+
+.message.assistant .msg-content {
+    flex: 1;
+    min-width: 0;
+}
+
+.message.error {
+    align-self: center;
+    background: #ffe0e0;
+    color: #c0392b;
+    border: 1px solid #f0b8b8;
+    font-size: 0.9rem;
+}
+
+.status-dot {
+    flex-shrink: 0;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    margin-top: 6px;
+    background: #5d4a7e;
+}
+
+.status-dot.typing {
+    animation: blink 1s step-start infinite;
+}
+
+.status-dot.done {
+    background: #4caf50;
+}
+
+@keyframes blink {
+    50% { opacity: 0; }
+}
+
+.message.assistant p {
+    margin-bottom: 0.6em;
+}
+
+.message.assistant p:last-child {
+    margin-bottom: 0;
+}
+
+.message.assistant pre {
+    position: relative;
+    background: #2b2b2b;
+    color: #f4f1ec;
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin: 8px 0;
+    overflow-x: auto;
+    white-space: pre;
+    font-family: 'Fira Code', 'Consolas', monospace;
+    font-size: 0.85rem;
+}
+
+.message.assistant code {
+    font-family: 'Fira Code', 'Consolas', monospace;
+}
+
+.message.assistant :not(pre) > code {
+    background: #ece6dc;
+    border-radius: 4px;
+    padding: 2px 5px;
+    font-size: 0.85em;
+}
+
+.copy-btn {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    background: rgba(255, 255, 255, 0.12);
+    color: #f4f1ec;
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 6px;
+    padding: 3px 9px;
+    font-size: 0.75rem;
+    cursor: pointer;
+    transition: background 0.15s ease;
+}
+
+.copy-btn:hover {
+    background: rgba(255, 255, 255, 0.25);
+}
+
+.tool-card {
+    border: 1px solid #d9d2c5;
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-top: 6px;
+    background: #fbf8f3;
+    font-size: 0.9rem;
+}
+
+.tool-card .tool-desc {
+    margin-bottom: 6px;
+}
+
+.message.assistant .tool-card code {
+    display: block;
+    background: #2b2b2b;
+    color: #f4f1ec;
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    font-family: 'Fira Code', 'Consolas', monospace;
+    font-size: 0.85rem;
+    overflow-x: auto;
+    white-space: pre;
+}
+
+.tool-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.tool-actions button {
+    border: none;
+    border-radius: 8px;
+    padding: 6px 14px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.tool-approve {
+    background: #4caf50;
+    color: #fff;
+}
+
+.tool-deny {
+    background: #e07a7a;
+    color: #fff;
+}
+
+.tool-actions button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.tool-result {
+    margin-top: 8px;
+}
+
+.tool-result pre {
+    background: #2b2b2b;
+    color: #f4f1ec;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: 'Fira Code', 'Consolas', monospace;
+    font-size: 0.8rem;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    max-height: 200px;
+}
+
+.chat-form {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+    padding-top: 8px;
+}
+
+.chat-form textarea {
+    flex: 1;
+    resize: none;
+    border: 1px solid #d9d2c5;
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-family: inherit;
+    font-size: 0.95rem;
+    max-height: 160px;
+}
+
+.chat-form textarea:focus {
+    outline: none;
+    border-color: #5d4a7e;
+    box-shadow: 0 0 0 2px rgba(93, 74, 126, 0.2);
+}
+
+.btn-primary, .btn-secondary, #send-btn {
+    border: none;
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s ease;
+}
+
+#send-btn, .btn-primary {
+    background: #5d4a7e;
+    color: #fff;
+}
+
+#send-btn:hover, .btn-primary:hover {
+    opacity: 0.9;
+}
+
+#send-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.btn-secondary {
+    background: #ece6dc;
+    color: #5d4a7e;
+}
+
+header .btn-secondary {
+    background: rgba(255, 255, 255, 0.15);
+    color: #fff;
+}
+
+.btn-secondary:hover {
+    opacity: 0.85;
+}
+
+.overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.overlay.hidden {
+    display: none;
+}
+
+.settings-panel {
+    background: #fff;
+    border-radius: 12px;
+    padding: 20px;
+    width: 90%;
+    max-width: 480px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.settings-panel h2 {
+    font-size: 1.1rem;
+}
+
+.settings-panel textarea {
+    width: 100%;
+    border: 1px solid #d9d2c5;
+    border-radius: 8px;
+    padding: 10px;
+    font-family: inherit;
+    font-size: 0.9rem;
+    resize: vertical;
+}
+
+.settings-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+}
