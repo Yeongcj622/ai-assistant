@@ -188,9 +188,14 @@ Working directory: ${dispDir}   Today: ${new Date().toDateString()}
 6. When unsure about an API, function name, or library — use web_search first.
 
 ## PDF / notes workflow
-- Use make_pdf with well-structured markdown (headers, bold key terms, bullet points, code blocks)
-- For summarizing: read source files → structure summary in markdown → make_pdf
-- PDF supports: headers, bold, italic, code blocks with syntax highlight, tables, lists, blockquotes
+- read_file automatically extracts text from .pdf files using pdftotext — no binary garbage
+- Large files are chunked: default 150 lines/read for PDFs, 300 for text. Use offset+limit to page through
+- For summarising multiple files: process ONE file at a time. For each file:
+    1. read_file(file, offset=1, limit=150) → digest → read_file(file, offset=151, limit=150) → … repeat until no lines remain
+    2. Write that file's key points to a running notes variable in your head
+    3. Move to next file only when done with current
+  Then combine all notes → make_pdf
+- make_pdf markdown: use ## for each source file section, bullet key points, bold important terms, code blocks for formulas/algorithms
 - Use a clear title; the PDF will have a professional cover with title + date
 
 ## Coding workflow
@@ -265,15 +270,46 @@ function renderReply(text) {
 }
 
 // ── File operations ───────────────────────────────────────────────────────────
+const PDF_DEFAULT_LIMIT  = 150;  // lines per chunk for PDFs
+const TEXT_DEFAULT_LIMIT = 300;  // lines per chunk for large text files
+
+async function extractPdfText(fullPath) {
+  return new Promise((resolve, reject) => {
+    execFile('pdftotext', ['-layout', fullPath, '-'], { timeout: 30000, maxBuffer: 20 * 1024 * 1024 }, (err, stdout) => {
+      if (err && !stdout) reject(new Error(`pdftotext failed: ${err.message}. Install with: sudo apt install poppler-utils`));
+      else resolve(stdout);
+    });
+  });
+}
+
 async function opReadFile(path, offset, limit) {
-  const full     = resolvePath(path);
-  const raw      = await readFile(full, 'utf8');
+  const full    = resolvePath(path);
+  const isPdf   = path.toLowerCase().endsWith('.pdf');
+  let raw;
+
+  if (isPdf) {
+    raw = await extractPdfText(full);
+  } else {
+    try { raw = await readFile(full, 'utf8'); }
+    catch { throw new Error(`Cannot read file: ${path}`); }
+  }
+
   const allLines = raw.split('\n');
   const start    = offset ? Math.max(0, offset - 1) : 0;
-  const slice    = limit ? allLines.slice(start, start + limit) : allLines.slice(start);
+  const defLimit = isPdf ? PDF_DEFAULT_LIMIT : TEXT_DEFAULT_LIMIT;
+  // If no explicit limit, cap at default to protect context window
+  const take     = limit ?? defLimit;
+  const slice    = allLines.slice(start, start + take);
   const numW     = String(start + slice.length).length;
   const numbered = slice.map((l, i) => `${String(start + i + 1).padStart(numW)} │ ${l}`).join('\n');
-  return `${path} (${allLines.length} lines total)\n${numbered}`;
+
+  const remaining = allLines.length - (start + slice.length);
+  const chunkNote = remaining > 0
+    ? `\n\n[Showing lines ${start + 1}–${start + slice.length} of ${allLines.length} total. ${remaining} lines remain. Use offset=${start + slice.length + 1} limit=${take} to read the next chunk.]`
+    : '';
+
+  const typeLabel = isPdf ? 'PDF extracted' : 'text';
+  return `${path} (${typeLabel}, ${allLines.length} lines total)\n${numbered}${chunkNote}`;
 }
 
 async function opWriteFile(path, content) {
