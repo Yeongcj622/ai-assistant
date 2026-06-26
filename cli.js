@@ -4,23 +4,33 @@ import { exec, execFile } from 'child_process';
 import { readFile, writeFile as fsWriteFile, readdir, stat, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { resolve, join, relative, dirname, basename } from 'path';
+import { promisify } from 'util';
 import { webSearch, fetchUrl } from './tools.js';
+import { generatePdf } from './pdf.js';
 
 dotenv.config();
+const execFileAsync = promisify(execFile);
 
 // ── Config ───────────────────────────────────────────────────────────────────
 const CEREBRAS_API_KEY = process.env.CEREBRAS_API_KEY || '';
-const CEREBRAS_MODEL   = process.env.CEREBRAS_MODEL   || 'llama-3.3-70b';
+const CEREBRAS_MODEL   = process.env.CEREBRAS_MODEL   || 'llama3.3-70b';
 const CEREBRAS_URL     = 'https://api.cerebras.ai/v1/chat/completions';
+
+const GOOGLE_API_KEY   = process.env.GOOGLE_API_KEY || '';
+const GEMINI_MODEL     = process.env.GEMINI_MODEL    || 'gemini-2.5-flash';
+const GEMINI_URL       = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
+
 const GROQ_API_KEY     = process.env.GROQ_API_KEY || '';
 const GROQ_URL         = 'https://api.groq.com/openai/v1/chat/completions';
 const OLLAMA_URL       = process.env.OLLAMA_URL   || 'http://localhost:11434';
 const OLLAMA_MODEL     = process.env.OLLAMA_MODEL || 'llama3.2:3b';
 
+// Backend priority chain — first available is primary, rest are fallbacks
 const OPENAI_BACKENDS = [
-  CEREBRAS_API_KEY && { name: 'Cerebras', label: `Cerebras/${CEREBRAS_MODEL}`, url: CEREBRAS_URL, key: CEREBRAS_API_KEY, model: CEREBRAS_MODEL },
-  GROQ_API_KEY     && { name: 'Groq',     label: `Groq/llama-4-scout`,         url: GROQ_URL,     key: GROQ_API_KEY,     model: 'meta-llama/llama-4-scout-17b-16e-instruct' },
-  GROQ_API_KEY     && { name: 'Groq-8b',  label: `Groq/llama-3.1-8b`,         url: GROQ_URL,     key: GROQ_API_KEY,     model: 'llama-3.1-8b-instant' },
+  CEREBRAS_API_KEY && { name: 'Cerebras', label: `Cerebras/${CEREBRAS_MODEL}`,   url: CEREBRAS_URL, key: CEREBRAS_API_KEY, model: CEREBRAS_MODEL },
+  GOOGLE_API_KEY   && { name: 'Gemini',   label: `Gemini/${GEMINI_MODEL}`,        url: GEMINI_URL,   key: GOOGLE_API_KEY,   model: GEMINI_MODEL },
+  GROQ_API_KEY     && { name: 'Groq',     label: 'Groq/llama-4-scout',            url: GROQ_URL,     key: GROQ_API_KEY,     model: 'meta-llama/llama-4-scout-17b-16e-instruct' },
+  GROQ_API_KEY     && { name: 'Groq-8b',  label: 'Groq/llama-3.1-8b',            url: GROQ_URL,     key: GROQ_API_KEY,     model: 'llama-3.1-8b-instant' },
 ].filter(Boolean);
 const USE_OLLAMA_ONLY = OPENAI_BACKENDS.length === 0;
 
@@ -32,21 +42,21 @@ let busy           = false;
 const queue        = [];
 
 // ── ANSI ─────────────────────────────────────────────────────────────────────
-const DIM    = '\x1b[2m';
-const BOLD   = '\x1b[1m';
-const ITALIC = '\x1b[3m';
+const DIM     = '\x1b[2m';
+const BOLD    = '\x1b[1m';
+const ITALIC  = '\x1b[3m';
 const USER_BG = '\x1b[48;2;30;32;40m\x1b[38;2;200;210;230m';
-const GREEN  = '\x1b[38;2;80;200;120m';
-const RED    = '\x1b[38;2;220;80;80m';
-const ORANGE = '\x1b[38;2;230;140;60m';
-const BLUE   = '\x1b[38;2;100;160;240m';
-const GRAY   = '\x1b[38;2;130;140;160m';
-const WHITE  = '\x1b[38;2;220;225;240m';
-const YELLOW = '\x1b[38;2;220;190;80m';
-const RESET  = '\x1b[0m';
-const BULLET = `${GREEN}●${RESET}`;
-const TREE   = `${GRAY}└${RESET}`;
-const BRANCH = `${GRAY}├${RESET}`;
+const GREEN   = '\x1b[38;2;80;200;120m';
+const RED     = '\x1b[38;2;220;80;80m';
+const ORANGE  = '\x1b[38;2;230;140;60m';
+const BLUE    = '\x1b[38;2;100;160;240m';
+const GRAY    = '\x1b[38;2;130;140;160m';
+const WHITE   = '\x1b[38;2;220;225;240m';
+const YELLOW  = '\x1b[38;2;220;190;80m';
+const RESET   = '\x1b[0m';
+const BULLET  = `${GREEN}●${RESET}`;
+const TREE    = `${GRAY}└${RESET}`;
+const BRANCH  = `${GRAY}├${RESET}`;
 const APPROVAL_PROMPT = `${BOLD}Allow? [y/N]${RESET} `;
 
 function getPrompt() {
@@ -55,12 +65,12 @@ function getPrompt() {
   return `${GRAY}${display}${RESET} ${GREEN}>${RESET} `;
 }
 
-// ── Tools ─────────────────────────────────────────────────────────────────────
+// ── Tools (10 total) ─────────────────────────────────────────────────────────
 const TOOLS = [
   {
     type: 'function', function: {
       name: 'read_file',
-      description: 'Read a file\'s contents. Always call this before editing a file. Supports offset and limit for large files.',
+      description: 'Read a file. ALWAYS call before editing to get exact content and line numbers. Returns numbered lines.',
       parameters: { type: 'object', properties: {
         path:   { type: 'string', description: 'File path (relative to working dir or absolute)' },
         offset: { type: 'number', description: 'Start line, 1-indexed (optional)' },
@@ -71,7 +81,7 @@ const TOOLS = [
   {
     type: 'function', function: {
       name: 'write_file',
-      description: 'Write or overwrite a file. Use for new files or complete rewrites. Prefer edit_file for partial changes.',
+      description: 'Write or overwrite a file entirely. Use for new files. Prefer edit_file for modifications to existing files. Creates parent dirs automatically.',
       parameters: { type: 'object', properties: {
         path:    { type: 'string' },
         content: { type: 'string' },
@@ -81,10 +91,10 @@ const TOOLS = [
   {
     type: 'function', function: {
       name: 'edit_file',
-      description: 'Replace an exact string in a file. old_string must match exactly (whitespace, indentation). Read the file first to get exact content. old_string must be unique in the file.',
+      description: 'Replace EXACTLY one occurrence of old_string with new_string in a file. old_string must match character-for-character (spaces, indentation, newlines). Read the file first. If old_string appears multiple times, add surrounding context lines to make it unique.',
       parameters: { type: 'object', properties: {
         path:       { type: 'string' },
-        old_string: { type: 'string', description: 'Exact text to find and replace (must be unique in file)' },
+        old_string: { type: 'string', description: 'Exact text to replace — must be unique in the file' },
         new_string: { type: 'string', description: 'Replacement text' },
       }, required: ['path', 'old_string', 'new_string'] },
     },
@@ -92,27 +102,39 @@ const TOOLS = [
   {
     type: 'function', function: {
       name: 'list_dir',
-      description: 'List files and directories (tree view, 2 levels deep). Use to explore project structure.',
+      description: 'List directory contents as a tree (2 levels). Use to understand project structure before diving in.',
       parameters: { type: 'object', properties: {
-        path: { type: 'string', description: 'Directory path (default: working dir)' },
+        path: { type: 'string', description: 'Directory (default: working dir)' },
       }, required: [] },
     },
   },
   {
     type: 'function', function: {
       name: 'search_code',
-      description: 'Search for text or regex patterns in files. Use to find definitions, usages, imports, or any text.',
+      description: 'Grep files for a pattern. Returns filename:line:content. Use to find definitions, usages, imports.',
       parameters: { type: 'object', properties: {
-        pattern:   { type: 'string', description: 'Text or regex to search for' },
-        path:      { type: 'string', description: 'Directory or file to search (default: working dir)' },
-        file_glob: { type: 'string', description: 'File pattern e.g. "*.js" "*.py" (optional)' },
+        pattern:   { type: 'string', description: 'Text or regex' },
+        path:      { type: 'string', description: 'Dir or file to search (default: working dir)' },
+        file_glob: { type: 'string', description: 'e.g. "*.js" "*.py" (optional)' },
       }, required: ['pattern'] },
     },
   },
   {
     type: 'function', function: {
+      name: 'make_pdf',
+      description: 'Create a professional PDF from markdown content. Use for: summarizing notes, creating reports, writing documents. Automatically opens the PDF when done.',
+      parameters: { type: 'object', properties: {
+        content:     { type: 'string', description: 'Full markdown content to put in the PDF' },
+        output_path: { type: 'string', description: 'Output .pdf path (relative to working dir). e.g. "summary.pdf"' },
+        title:       { type: 'string', description: 'Document title shown on the cover' },
+        author:      { type: 'string', description: 'Author name (optional)' },
+      }, required: ['content', 'output_path'] },
+    },
+  },
+  {
+    type: 'function', function: {
       name: 'web_search',
-      description: 'Search the web for current info, documentation, APIs, news, prices. Use proactively for anything you\'re not certain about.',
+      description: 'Search the web for current facts, news, documentation, prices, APIs. Use freely for anything you are uncertain about.',
       parameters: { type: 'object', properties: {
         query: { type: 'string' },
       }, required: ['query'] },
@@ -121,7 +143,7 @@ const TOOLS = [
   {
     type: 'function', function: {
       name: 'fetch_url',
-      description: 'Fetch the full text of a web page. Use after web_search to read a specific result.',
+      description: 'Fetch the full readable text of a web page. Use after web_search to read a specific result.',
       parameters: { type: 'object', properties: {
         url: { type: 'string' },
       }, required: ['url'] },
@@ -130,10 +152,10 @@ const TOOLS = [
   {
     type: 'function', function: {
       name: 'run_command',
-      description: 'Run a shell command (requires user approval). Use for: running tests, building code, git operations, installing packages, etc.',
+      description: 'Run a shell command (requires your approval). Use for: tests, builds, git, npm install, etc.',
       parameters: { type: 'object', properties: {
         command:     { type: 'string' },
-        description: { type: 'string', description: 'Plain-English explanation of what it does and why' },
+        description: { type: 'string', description: 'What it does and why' },
       }, required: ['command', 'description'] },
     },
   },
@@ -143,37 +165,41 @@ const TOOLS = [
 function buildSystem() {
   const home    = process.env.HOME || '';
   const dispDir = workdir.startsWith(home) ? '~' + workdir.slice(home.length) : workdir;
-  return `You are an expert software engineer and personal assistant running in the terminal.
-Working directory: ${dispDir}  |  Today: ${new Date().toDateString()}
+  return `You are an expert software engineer and personal assistant in the terminal.
+Working directory: ${dispDir}   Today: ${new Date().toDateString()}
 
-## Tools available
-- read_file(path, offset?, limit?)       — read any file; ALWAYS call before editing
-- write_file(path, content)              — create or fully overwrite a file
-- edit_file(path, old_string, new_string)— precise replacement; safer than write_file for edits
-- list_dir(path?)                        — explore directory structure
-- search_code(pattern, path?, file_glob?)— grep-style search across files
-- web_search(query)                      — current info, docs, APIs
-- fetch_url(url)                         — read a full web page
-- run_command(command, description)      — shell command (needs user approval)
+## Tools
+- read_file(path, offset?, limit?)          — numbered output; ALWAYS read before editing
+- write_file(path, content)                 — full write; for new files or complete rewrites
+- edit_file(path, old_string, new_string)   — precise replacement; safer for edits; read first
+- list_dir(path?)                           — project tree
+- search_code(pattern, path?, file_glob?)   — grep across files
+- make_pdf(content, output_path, title?, author?) — PDF from markdown, auto-opens
+- web_search(query)                         — current info, docs, APIs
+- fetch_url(url)                            — read full web page
+- run_command(command, description)         — shell (needs approval)
+
+## Accuracy rules — follow strictly
+1. ALWAYS read_file before edit_file. Never guess file content.
+2. edit_file old_string must be unique. Include extra context lines if needed.
+3. After write_file or edit_file you will see the file content back — verify it looks correct before proceeding.
+4. If a write verification shows a mistake, fix it immediately with another edit_file.
+5. For multi-file tasks: finish one file completely before moving to the next.
+6. When unsure about an API, function name, or library — use web_search first.
+
+## PDF / notes workflow
+- Use make_pdf with well-structured markdown (headers, bold key terms, bullet points, code blocks)
+- For summarizing: read source files → structure summary in markdown → make_pdf
+- PDF supports: headers, bold, italic, code blocks with syntax highlight, tables, lists, blockquotes
+- Use a clear title; the PDF will have a professional cover with title + date
 
 ## Coding workflow
-1. list_dir / search_code to explore structure and find relevant files
-2. read_file to understand the exact current content before any edit
-3. edit_file for targeted changes (old_string must be unique and exactly match)
-4. write_file only for new files or complete rewrites
-5. run_command to test, build, run — iterate until it works
+list_dir → search_code → read_file → edit_file / write_file → run_command (test) → iterate
 
-## Rules
-- Never guess file content — always read_file first
-- edit_file old_string must be unique; include enough context lines to make it unique
-- If a task needs many files changed, do them one at a time
-- For web questions or docs you're unsure about, use web_search
-- Cite sources [Title](URL) in responses
-- Code in fenced blocks with language tag
-- Be direct and concise; show diffs/changes clearly`;
+Be direct and concise in explanations. Show code changes clearly. Cite web sources [Title](URL).`;
 }
 
-// ── Context (trimmed) ─────────────────────────────────────────────────────────
+// ── Context window (trim to last 20 to avoid TPM blowout) ────────────────────
 function buildContext() {
   const recent = messages.length > 20 ? messages.slice(-20) : messages;
   return [{ role: 'system', content: buildSystem() }, ...recent];
@@ -210,8 +236,8 @@ function renderCodeBlock(lang, code) {
 
 function renderReply(text) {
   const lines = text.split('\n');
-  const out = [];
-  let inCode = false, codeLang = '', codeBuf = [];
+  const out   = [];
+  let inCode  = false, codeLang = '', codeBuf = [];
 
   for (const line of lines) {
     if (!inCode && line.startsWith('```')) {
@@ -230,8 +256,8 @@ function renderReply(text) {
       .replace(/\*([^*]+)\*/g,     `${ITALIC}$1${RESET}`)
       .replace(/`([^`]+)`/g,       `${ORANGE}$1${RESET}`)
       .replace(/\[([^\]]+)\]\(([^)]+)\)/g, `${BLUE}$1${RESET}${GRAY}(${DIM}$2${RESET}${GRAY})${RESET}`)
-      .replace(/^#{1,3} (.+)$/, `${BOLD}${WHITE}$1${RESET}`)
-      .replace(/^[-*] /,        `${GRAY}• ${RESET}`);
+      .replace(/^#{1,4} (.+)$/,    `${BOLD}${WHITE}$1${RESET}`)
+      .replace(/^[-*] /,           `${GRAY}• ${RESET}`);
     out.push(l);
   }
   if (inCode && codeBuf.length) out.push(renderCodeBlock(codeLang, codeBuf.join('\n')));
@@ -240,14 +266,13 @@ function renderReply(text) {
 
 // ── File operations ───────────────────────────────────────────────────────────
 async function opReadFile(path, offset, limit) {
-  const full = resolvePath(path);
-  const raw  = await readFile(full, 'utf8');
+  const full     = resolvePath(path);
+  const raw      = await readFile(full, 'utf8');
   const allLines = raw.split('\n');
   const start    = offset ? Math.max(0, offset - 1) : 0;
-  const lines    = limit ? allLines.slice(start, start + limit) : allLines.slice(start);
-  const numW     = String(start + lines.length).length;
-  // Return numbered lines to the AI so it knows exact line positions
-  const numbered = lines.map((l, i) => `${String(start + i + 1).padStart(numW)} │ ${l}`).join('\n');
+  const slice    = limit ? allLines.slice(start, start + limit) : allLines.slice(start);
+  const numW     = String(start + slice.length).length;
+  const numbered = slice.map((l, i) => `${String(start + i + 1).padStart(numW)} │ ${l}`).join('\n');
   return `${path} (${allLines.length} lines total)\n${numbered}`;
 }
 
@@ -255,24 +280,45 @@ async function opWriteFile(path, content) {
   const full = resolvePath(path);
   await mkdir(dirname(full), { recursive: true });
   await fsWriteFile(full, content, 'utf8');
-  return content.split('\n').length;
+  // Return first 20 lines so AI can self-verify
+  const preview = content.split('\n').slice(0, 20).join('\n');
+  const total   = content.split('\n').length;
+  return `Wrote ${total} lines to ${path}.\n\nVerification (first 20 lines):\n${preview}${total > 20 ? `\n… (${total - 20} more lines)` : ''}`;
 }
 
 async function opEditFile(path, oldStr, newStr) {
   const full    = resolvePath(path);
   const content = await readFile(full, 'utf8');
   const count   = content.split(oldStr).length - 1;
-  if (count === 0) throw new Error(`old_string not found in ${path}. Read the file first to get exact content.`);
-  if (count > 1)   throw new Error(`old_string appears ${count} times — make it more unique by including more surrounding lines.`);
-  await fsWriteFile(full, content.replace(oldStr, newStr), 'utf8');
-  return { oldLines: oldStr.split('\n').length, newLines: newStr.split('\n').length };
+  if (count === 0) throw new Error(`old_string not found in ${path}. The text must match exactly — read the file again to copy the exact content.`);
+  if (count > 1)   throw new Error(`old_string found ${count} times in ${path}. Add more surrounding lines to make it unique.`);
+
+  const newContent = content.replace(oldStr, newStr);
+  await fsWriteFile(full, newContent, 'utf8');
+
+  // Find where the edit landed and return context for self-verification
+  const allLines  = newContent.split('\n');
+  const editStart = newContent.indexOf(newStr);
+  const lineNum   = newContent.slice(0, editStart).split('\n').length;
+  const ctxStart  = Math.max(0, lineNum - 3);
+  const ctxEnd    = Math.min(allLines.length, lineNum + newStr.split('\n').length + 2);
+  const context   = allLines.slice(ctxStart, ctxEnd)
+    .map((l, i) => `${ctxStart + i + 1} │ ${l}`).join('\n');
+
+  const ol = oldStr.split('\n').length;
+  const nl = newStr.split('\n').length;
+  return `Edited ${path}: replaced ${ol} line${ol>1?'s':''} → ${nl} line${nl>1?'s':''}.\n\nVerification (lines ${ctxStart+1}–${ctxEnd}):\n${context}`;
 }
 
 async function opListDir(path, depth = 0, prefix = '') {
   const full    = resolvePath(path || '');
-  const entries = await readdir(full, { withFileTypes: true });
+  let entries;
+  try { entries = await readdir(full, { withFileTypes: true }); }
+  catch { return `(cannot read directory: ${path || workdir})\n`; }
+
+  const skip    = new Set(['node_modules', '__pycache__', '.git', 'dist', 'build', 'target', '.next', 'venv', '.venv']);
   const visible = entries
-    .filter(e => !e.name.startsWith('.') && e.name !== 'node_modules' && e.name !== '__pycache__' && e.name !== 'target' && e.name !== 'dist')
+    .filter(e => !e.name.startsWith('.') && !skip.has(e.name))
     .sort((a, b) => {
       if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
       return a.name.localeCompare(b.name);
@@ -280,13 +326,10 @@ async function opListDir(path, depth = 0, prefix = '') {
 
   let out = '';
   for (let i = 0; i < visible.length; i++) {
-    const e      = visible[i];
-    const isLast = i === visible.length - 1;
-    const conn   = isLast ? '└─ ' : '├─ ';
-    const child  = isLast ? '   ' : '│  ';
-    out += `${prefix}${conn}${e.name}${e.isDirectory() ? '/' : ''}\n`;
+    const e = visible[i]; const last = i === visible.length - 1;
+    out += `${prefix}${last ? '└─ ' : '├─ '}${e.name}${e.isDirectory() ? '/' : ''}\n`;
     if (e.isDirectory() && depth < 1) {
-      try { out += await opListDir(join(full, e.name), depth + 1, prefix + child); } catch {}
+      out += await opListDir(join(full, e.name), depth + 1, prefix + (last ? '   ' : '│  '));
     }
   }
   return out;
@@ -295,15 +338,13 @@ async function opListDir(path, depth = 0, prefix = '') {
 function opSearchCode(pattern, path, fileGlob) {
   return new Promise(resolve => {
     const searchPath = resolvePath(path || '');
-    const args = ['-r', '-n', '-m', '5', '--color=never', '--max-count=5'];
+    const args = ['-r', '-n', '-m', '5', '--color=never'];
     if (fileGlob) args.push(`--include=${fileGlob}`);
     args.push('--', pattern, searchPath);
     execFile('grep', args, { timeout: 15000, maxBuffer: 2 * 1024 * 1024 }, (_err, stdout) => {
       if (!stdout.trim()) { resolve('(no matches)'); return; }
-      const lines = stdout.trim().split('\n').slice(0, 60);
-      // Make paths relative to workdir
-      const out = lines.map(l => l.replace(workdir + '/', '')).join('\n');
-      resolve(out + (lines.length >= 60 ? '\n… (more results, narrow your search)' : ''));
+      const lines = stdout.trim().split('\n').slice(0, 60).map(l => l.replace(workdir + '/', ''));
+      resolve(lines.join('\n') + (lines.length >= 60 ? '\n… (narrow your search for more precise results)' : ''));
     });
   });
 }
@@ -311,10 +352,10 @@ function opSearchCode(pattern, path, fileGlob) {
 // ── Tool execution ────────────────────────────────────────────────────────────
 async function executeOneTool(name, args) {
 
-  // ── Read-only tools (auto, no approval) ─────────────────────────────────────
+  // ── Read-only (auto, no approval) ────────────────────────────────────────────
   if (name === 'read_file') {
-    const relPath = relative(workdir, resolvePath(args.path));
-    process.stdout.write(`${BULLET} ${GRAY}Read${RESET}(${WHITE}${relPath}${RESET})\n`);
+    const rel = relative(workdir, resolvePath(args.path)) || basename(args.path);
+    process.stdout.write(`${BULLET} ${GRAY}Read${RESET}(${WHITE}${rel}${RESET})\n`);
     const out = await opReadFile(args.path, args.offset, args.limit);
     const lc  = out.split('\n').length - 1;
     process.stdout.write(`  ${TREE} ${GRAY}${lc} lines${RESET}\n`);
@@ -322,17 +363,16 @@ async function executeOneTool(name, args) {
   }
 
   if (name === 'list_dir') {
-    const relPath = args.path ? relative(workdir, resolvePath(args.path)) || '.' : '.';
-    process.stdout.write(`${BULLET} ${GRAY}ListDir${RESET}(${WHITE}${relPath}${RESET})\n`);
+    const p = args.path ? relative(workdir, resolvePath(args.path)) || '.' : '.';
+    process.stdout.write(`${BULLET} ${GRAY}ListDir${RESET}(${WHITE}${p}${RESET})\n`);
     const tree = await opListDir(args.path);
-    const lines = tree.trim().split('\n').length;
-    process.stdout.write(`  ${TREE} ${GRAY}${lines} entries${RESET}\n`);
+    process.stdout.write(`  ${TREE} ${GRAY}${tree.trim().split('\n').length} entries${RESET}\n`);
     return tree || '(empty)';
   }
 
   if (name === 'search_code') {
-    process.stdout.write(`${BULLET} ${GRAY}Search${RESET}(${WHITE}${args.pattern}${RESET}${args.file_glob ? `  ${GRAY}${args.file_glob}${RESET}` : ''})\n`);
-    const out = await opSearchCode(args.pattern, args.path, args.file_glob);
+    process.stdout.write(`${BULLET} ${GRAY}Search${RESET}(${WHITE}${args.pattern}${RESET}${args.file_glob ? `  ${GRAY}in ${args.file_glob}${RESET}` : ''})\n`);
+    const out   = await opSearchCode(args.pattern, args.path, args.file_glob);
     const count = out === '(no matches)' ? 0 : out.split('\n').length;
     process.stdout.write(`  ${TREE} ${GRAY}${count || 'no'} match${count !== 1 ? 'es' : ''}${RESET}\n`);
     return out;
@@ -353,33 +393,50 @@ async function executeOneTool(name, args) {
     return text;
   }
 
-  // ── Write tools (auto-approved, shown clearly) ───────────────────────────────
+  // ── Writes (auto-applied, verified) ──────────────────────────────────────────
   if (name === 'write_file') {
-    const relPath = relative(workdir, resolvePath(args.path)) || basename(args.path);
-    const lc      = args.content.split('\n').length;
-    process.stdout.write(`${BULLET} ${GREEN}Write${RESET}(${WHITE}${relPath}${RESET})\n`);
-    await opWriteFile(args.path, args.content);
+    const rel = relative(workdir, resolvePath(args.path)) || basename(args.path);
+    const lc  = args.content.split('\n').length;
+    process.stdout.write(`${BULLET} ${GREEN}Write${RESET}(${WHITE}${rel}${RESET})\n`);
+    const result = await opWriteFile(args.path, args.content);
     process.stdout.write(`  ${TREE} ${GRAY}Wrote ${lc} lines${RESET}\n`);
-    return `Wrote ${lc} lines to ${relPath}`;
+    return result;
   }
 
   if (name === 'edit_file') {
-    const relPath  = relative(workdir, resolvePath(args.path)) || basename(args.path);
+    const rel      = relative(workdir, resolvePath(args.path)) || basename(args.path);
     const oldLines = args.old_string.split('\n');
     const newLines = args.new_string.split('\n');
-    process.stdout.write(`${BULLET} ${ORANGE}Edit${RESET}(${WHITE}${relPath}${RESET})\n`);
-    // Show mini-diff
+    process.stdout.write(`${BULLET} ${ORANGE}Edit${RESET}(${WHITE}${rel}${RESET})\n`);
     const maxShow = 3;
     oldLines.slice(0, maxShow).forEach(l => process.stdout.write(`  ${RED}- ${l}${RESET}\n`));
     if (oldLines.length > maxShow) process.stdout.write(`  ${RED}  … ${oldLines.length - maxShow} more${RESET}\n`);
     newLines.slice(0, maxShow).forEach(l => process.stdout.write(`  ${GREEN}+ ${l}${RESET}\n`));
     if (newLines.length > maxShow) process.stdout.write(`  ${GREEN}  … ${newLines.length - maxShow} more${RESET}\n`);
-    const { oldLines: ol, newLines: nl } = await opEditFile(args.path, args.old_string, args.new_string);
-    process.stdout.write(`  ${TREE} ${GRAY}-${ol} +${nl} lines${RESET}\n`);
-    return `Edited ${relPath}: replaced ${ol} lines with ${nl} lines`;
+    const result = await opEditFile(args.path, args.old_string, args.new_string);
+    process.stdout.write(`  ${TREE} ${GRAY}-${oldLines.length} +${newLines.length} lines${RESET}\n`);
+    return result;
   }
 
-  // ── Shell command (always needs approval) ────────────────────────────────────
+  // ── PDF generation ────────────────────────────────────────────────────────────
+  if (name === 'make_pdf') {
+    const rel = relative(workdir, resolvePath(args.output_path)) || args.output_path;
+    process.stdout.write(`${BULLET} ${BLUE}PDF${RESET}(${WHITE}${rel}${RESET})\n`);
+    if (args.title) process.stdout.write(`  ${BRANCH} ${GRAY}title: ${args.title}${RESET}\n`);
+    const outPath = await generatePdf(
+      args.content,
+      resolvePath(args.output_path),
+      args.title || '',
+      args.author || '',
+      true,
+    );
+    const sizeResult = await execFileAsync('du', ['-sh', outPath]).catch(() => ({ stdout: '?' }));
+    const size = sizeResult.stdout?.trim().split('\t')[0] || '?';
+    process.stdout.write(`  ${TREE} ${GRAY}${size} — opened in PDF viewer${RESET}\n`);
+    return `PDF created: ${outPath} (${size}). Opened in PDF viewer.`;
+  }
+
+  // ── Shell (always needs approval) ─────────────────────────────────────────────
   if (name === 'run_command') {
     process.stdout.write(`${BULLET} ${ORANGE}Bash${RESET}(${WHITE}${args.command}${RESET})\n`);
     process.stdout.write(`  ${BRANCH} ${GRAY}${args.description || ''}${RESET}\n`);
@@ -402,10 +459,11 @@ async function executeOneTool(name, args) {
   throw new Error(`Unknown tool: ${name}`);
 }
 
-// Run web/read tools in parallel; writes/commands must be sequential
+// Parallel for reads, sequential for writes
 async function executeTools(toolCalls) {
-  const parallel   = toolCalls.filter(tc => ['web_search', 'fetch_url', 'read_file', 'list_dir', 'search_code'].includes(tc.name));
-  const sequential = toolCalls.filter(tc => !['web_search', 'fetch_url', 'read_file', 'list_dir', 'search_code'].includes(tc.name));
+  const readOnly   = new Set(['web_search', 'fetch_url', 'read_file', 'list_dir', 'search_code']);
+  const parallel   = toolCalls.filter(tc => readOnly.has(tc.name));
+  const sequential = toolCalls.filter(tc => !readOnly.has(tc.name));
   const results    = new Map();
 
   clearLine();
@@ -416,7 +474,6 @@ async function executeTools(toolCalls) {
       results.set(tc.id || tc.name, `Error: ${e.message}`);
     }
   }));
-
   for (const tc of sequential) {
     try   { results.set(tc.id || tc.name, await executeOneTool(tc.name, tc.args)); }
     catch (e) {
@@ -424,20 +481,18 @@ async function executeTools(toolCalls) {
       results.set(tc.id || tc.name, `Error: ${e.message}`);
     }
   }
-
   return toolCalls.map(tc => ({
-    role: 'tool',
-    tool_call_id: tc.id || tc.name,
+    role: 'tool', tool_call_id: tc.id || tc.name,
     content: results.get(tc.id || tc.name) ?? '',
   }));
 }
 
 function runShell(command) {
   return new Promise(resolve => {
-    exec(command, { cwd: workdir, timeout: 60000, maxBuffer: 2 * 1024 * 1024 }, (err, stdout, stderr) => {
+    exec(command, { cwd: workdir, timeout: 60000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
       const parts = [];
       if (stdout) parts.push(stdout.slice(0, 30000));
-      if (stderr) parts.push(`stderr: ${stderr.slice(0, 5000)}`);
+      if (stderr) parts.push(`stderr:\n${stderr.slice(0, 5000)}`);
       if (err && !stdout && !stderr) parts.push(`error: ${err.message}`);
       parts.push(`exit: ${err ? (err.code ?? 1) : 0}`);
       resolve(parts.join('\n').trim());
@@ -445,7 +500,7 @@ function runShell(command) {
   });
 }
 
-// ── SSE stream parser ─────────────────────────────────────────────────────────
+// ── SSE stream (Groq / Cerebras / Gemini — all OpenAI-compatible) ─────────────
 async function* sseLines(body) {
   const reader = body.getReader(); const decoder = new TextDecoder(); let buf = '';
   while (true) {
@@ -457,7 +512,6 @@ async function* sseLines(body) {
   }
 }
 
-// ── OpenAI-compatible stream ──────────────────────────────────────────────────
 async function* streamOpenAI(backend, msgs) {
   const res = await fetch(backend.url, {
     method: 'POST',
@@ -468,7 +522,7 @@ async function* streamOpenAI(backend, msgs) {
     const body = await res.text();
     const err  = new Error(`${backend.name} ${res.status}: ${body}`);
     err.status = res.status;
-    const m = body.match(/try again in ([0-9.]+)s/i);
+    const m    = body.match(/try again in ([0-9.]+)s/i);
     err.retryAfter = m ? Math.ceil(parseFloat(m[1])) : 10;
     throw err;
   }
@@ -498,11 +552,10 @@ async function* streamOpenAI(backend, msgs) {
   }
 }
 
-// ── Ollama stream ─────────────────────────────────────────────────────────────
+// ── Ollama ────────────────────────────────────────────────────────────────────
 async function* streamOllama(msgs) {
   const res = await fetch(`${OLLAMA_URL}/api/chat`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ model: OLLAMA_MODEL, messages: msgs, stream: true, tools: TOOLS }),
   });
   if (!res.ok) throw new Error(`Ollama ${res.status}`);
@@ -534,15 +587,9 @@ async function runTurn(backendIndex = 0) {
   clearLine();
   process.stdout.write(`${BULLET} ${GRAY}…${RESET}`);
 
-  let stream;
-  let usedBackend = null;
-
-  if (!USE_OLLAMA_ONLY && backendIndex < OPENAI_BACKENDS.length) {
-    usedBackend = OPENAI_BACKENDS[backendIndex];
-    stream = streamOpenAI(usedBackend, ctx);
-  } else {
-    stream = streamOllama(ctx);
-  }
+  const usedBackend = !USE_OLLAMA_ONLY && backendIndex < OPENAI_BACKENDS.length
+    ? OPENAI_BACKENDS[backendIndex] : null;
+  const stream = usedBackend ? streamOpenAI(usedBackend, ctx) : streamOllama(ctx);
 
   let firstToken = true;
   let fullContent = '';
@@ -576,9 +623,9 @@ async function runTurn(backendIndex = 0) {
         });
 
         if (event.toolCalls.length > 0) {
-          const toolResults = await executeTools(event.toolCalls);
+          const results = await executeTools(event.toolCalls);
           process.stdout.write('\n');
-          messages.push(...toolResults);
+          messages.push(...results);
           await runTurn(backendIndex);
           return;
         }
@@ -590,16 +637,16 @@ async function runTurn(backendIndex = 0) {
     }
   } catch (err) {
     clearLine();
-    if (err.status === 429 && !USE_OLLAMA_ONLY && backendIndex + 1 < OPENAI_BACKENDS.length) {
-      const next = OPENAI_BACKENDS[backendIndex + 1];
-      process.stdout.write(`  ${TREE} ${YELLOW}${usedBackend?.name} rate-limited → ${next.name}${RESET}\n`);
+    // Try next backend on any API error (rate limit, model not found, auth, etc.)
+    if (err.status && !USE_OLLAMA_ONLY && backendIndex + 1 < OPENAI_BACKENDS.length) {
+      const next   = OPENAI_BACKENDS[backendIndex + 1];
+      const reason = err.status === 429 ? 'rate-limited' : err.status === 404 ? 'model not found' : `error ${err.status}`;
+      process.stdout.write(`  ${TREE} ${YELLOW}${usedBackend?.name} ${reason} → ${next.name}${RESET}\n`);
       return runTurn(backendIndex + 1);
     }
-    const hint = err.status === 429
-      ? 'All backends rate-limited. Wait a moment and try again.'
-      : USE_OLLAMA_ONLY
-        ? `Could not reach Ollama at ${OLLAMA_URL}. Is it running?`
-        : err.message;
+    const hint = err.status === 429 ? 'All backends rate-limited. Wait a moment.'
+      : USE_OLLAMA_ONLY ? `Cannot reach Ollama at ${OLLAMA_URL}. Is it running?`
+      : err.message;
     process.stdout.write(`${BULLET} ${GRAY}${hint}${RESET}\n\n`);
     rl.setPrompt(getPrompt());
     rl.prompt();
@@ -616,14 +663,14 @@ async function processQueue() {
 
 function printHelp() {
   process.stdout.write(`\n${BULLET} ${WHITE}Commands${RESET}\n`);
-  process.stdout.write(`  ${BRANCH} ${ORANGE}/cd <path>${RESET}      ${GRAY}change working directory${RESET}\n`);
-  process.stdout.write(`  ${BRANCH} ${ORANGE}/clear${RESET}          ${GRAY}clear conversation history${RESET}\n`);
-  process.stdout.write(`  ${BRANCH} ${ORANGE}/wd${RESET}             ${GRAY}show current working directory${RESET}\n`);
-  process.stdout.write(`  ${BRANCH} ${ORANGE}/help${RESET}           ${GRAY}show this help${RESET}\n`);
-  process.stdout.write(`  ${TREE}  ${ORANGE}/exit${RESET}           ${GRAY}quit${RESET}\n\n`);
+  process.stdout.write(`  ${BRANCH} ${ORANGE}/cd <path>${RESET}    ${GRAY}change working directory (shown in prompt)${RESET}\n`);
+  process.stdout.write(`  ${BRANCH} ${ORANGE}/wd${RESET}           ${GRAY}print current working directory${RESET}\n`);
+  process.stdout.write(`  ${BRANCH} ${ORANGE}/clear${RESET}        ${GRAY}clear conversation history${RESET}\n`);
+  process.stdout.write(`  ${BRANCH} ${ORANGE}/help${RESET}         ${GRAY}show this${RESET}\n`);
+  process.stdout.write(`  ${TREE}  ${ORANGE}/exit${RESET}         ${GRAY}quit${RESET}\n\n`);
 }
 
-// ── Startup banner ────────────────────────────────────────────────────────────
+// ── Banner ────────────────────────────────────────────────────────────────────
 const primaryLabel = OPENAI_BACKENDS[0]?.label ?? `Ollama/${OLLAMA_MODEL}`;
 const fallbacks    = OPENAI_BACKENDS.slice(1).map(b => b.label).join(' → ');
 const home         = process.env.HOME || '';
@@ -633,7 +680,6 @@ process.stdout.write(`\n${BULLET} ${WHITE}AI Assistant${RESET}  ${GRAY}${primary
 if (fallbacks) process.stdout.write(`  ${GRAY}↳ ${fallbacks}${RESET}`);
 process.stdout.write(`\n  ${BRANCH} ${GRAY}workdir: ${dispDir}${RESET}\n`);
 process.stdout.write(`  ${TREE}  ${GRAY}/help for commands${RESET}\n\n`);
-
 rl.setPrompt(getPrompt());
 rl.prompt();
 
@@ -647,7 +693,6 @@ rl.on('line', async (line) => {
   }
 
   const text = line.trim();
-
   if (process.stdout.isTTY && text) {
     readline.moveCursor(process.stdout, 0, -1);
     readline.clearLine(process.stdout, 0);
@@ -670,7 +715,7 @@ rl.on('line', async (line) => {
       process.stdout.write(`  ${TREE} ${GRAY}→ ${d}${RESET}\n\n`);
       rl.setPrompt(getPrompt());
     } else {
-      process.stdout.write(`  ${TREE} ${GRAY}Directory not found: ${target}${RESET}\n\n`);
+      process.stdout.write(`  ${TREE} ${GRAY}Not found: ${target}${RESET}\n\n`);
     }
     rl.prompt(); return;
   }
